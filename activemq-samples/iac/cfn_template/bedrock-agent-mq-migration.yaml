@@ -1,0 +1,538 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for creating a Bedrock agent to evaluate migration of messaging services to Amazon MQ.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Agent Configuration
+        Parameters:
+          - AgentName
+          - ModelId
+          - S3BucketName
+      - Label:
+          default: Knowledge Base Configuration
+        Parameters:
+          - KnowledgeBaseName
+          - KnowledgeBaseS3Prefix
+    ParameterLabels:
+      AgentName:
+        default: Bedrock Agent Name
+      ModelId:
+        default: Foundation Model ID
+      S3BucketName:
+        default: S3 Bucket Name
+      KnowledgeBaseName:
+        default: Knowledge Base Name
+      KnowledgeBaseS3Prefix:
+        default: Knowledge Base S3 Prefix
+
+Parameters:
+  AgentName:
+    Description: Name for the Bedrock agent
+    Type: String
+    Default: MQMigrationEvaluationAgent
+    MinLength: 1
+    ConstraintDescription: Agent name is required!
+  
+  ModelId:
+    Description: The foundation model ID to use for the agent
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    AllowedValues:
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-instant-v1
+      - amazon.titan-text-express-v1
+    ConstraintDescription: Must be a valid Bedrock model ID
+  
+  S3BucketName:
+    Description: Name of the S3 bucket to store agent artifacts and knowledge base documents
+    Type: String
+    Default: mq-migration-evaluation-agent-bucket
+    MinLength: 3
+    ConstraintDescription: S3 bucket name is required!
+  
+  KnowledgeBaseName:
+    Description: Name for the knowledge base
+    Type: String
+    Default: MQMigrationKnowledgeBase
+    MinLength: 1
+    ConstraintDescription: Knowledge base name is required!
+  
+  KnowledgeBaseS3Prefix:
+    Description: S3 prefix for knowledge base documents
+    Type: String
+    Default: knowledge-base/
+    MinLength: 1
+    ConstraintDescription: Knowledge base S3 prefix is required!
+
+Resources:
+  # S3 Bucket for agent artifacts and knowledge base documents
+  AgentS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - AgentS3Bucket
+
+  # IAM Role for the Bedrock agent
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: BedrockAgentS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+        - PolicyName: BedrockAgentMQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mq:Describe*
+                  - mq:List*
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - BedrockAgentRole
+              
+  # Knowledge Base for MQ Migration Information
+  MQMigrationKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: AgentS3Bucket
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      Description: Knowledge base containing information about messaging services and Amazon MQ migration
+      RoleArn: !GetAtt BedrockAgentRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1
+      StorageConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketName: !Ref S3BucketName
+          BucketOwner: !Ref AWS::AccountId
+          S3Prefix: !Ref KnowledgeBaseS3Prefix
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MQMigrationKnowledgeBase
+
+  # Bedrock Agent for MQ Migration Evaluation
+  MQMigrationAgent:
+    Type: AWS::Bedrock::Agent
+    DependsOn: MQMigrationKnowledgeBase
+    Properties:
+      AgentName: !Ref AgentName
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      FoundationModel: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}
+      Description: Agent to evaluate migration of messaging services to Amazon MQ
+      IdleSessionTTLInSeconds: 1800
+      CustomerEncryptionKeyArn: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/bedrock
+      InstructionConfig:
+        InstructionText: |
+          You are an expert assistant that helps users evaluate the migration of their existing messaging services to Amazon MQ.
+          
+          Your primary responsibilities are:
+          1. Gather information about the user's current messaging infrastructure
+          2. Analyze compatibility between their current messaging services and Amazon MQ
+          3. Provide recommendations for migration strategies
+          4. Estimate costs and effort for migration
+          5. Identify potential challenges and solutions
+          
+          You have access to a knowledge base containing information about Amazon MQ, ActiveMQ, RabbitMQ, and migration best practices.
+          
+          When users ask about migration, always:
+          - Ask about their current messaging service type and version
+          - Inquire about their current usage patterns and requirements
+          - Provide specific, actionable recommendations
+          - Reference AWS documentation and best practices
+      KnowledgeBaseAssociations:
+        - KnowledgeBaseId: !Ref MQMigrationKnowledgeBase
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MQMigrationAgent
+              
+  # Action Group for Analyzing Current Messaging Infrastructure
+  AnalyzeInfrastructureActionGroup:
+    Type: AWS::Bedrock::AgentActionGroup
+    DependsOn: MQMigrationAgent
+    Properties:
+      AgentId: !Ref MQMigrationAgent
+      ActionGroupName: AnalyzeInfrastructure
+      ActionGroupExecutor:
+        Lambda: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-analyze-infrastructure
+      Description: Analyzes the current messaging infrastructure and provides compatibility assessment
+      ParentActionGroupSignature: AMAZON.UserInput
+      ActionGroupState: ENABLED
+      ApiSchema:
+        Payload: |
+          {
+            "openapi": "3.0.0",
+            "info": {
+              "title": "Analyze Infrastructure API",
+              "version": "1.0.0",
+              "description": "API for analyzing messaging infrastructure"
+            },
+            "paths": {
+              "/analyze": {
+                "post": {
+                  "summary": "Analyze messaging infrastructure",
+                  "operationId": "analyzeInfrastructure",
+                  "requestBody": {
+                    "required": true,
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "type": "object",
+                          "required": ["messagingServiceType"],
+                          "properties": {
+                            "messagingServiceType": {
+                              "type": "string",
+                              "description": "Type of messaging service (e.g., ActiveMQ, RabbitMQ, IBM MQ, etc.)"
+                            },
+                            "version": {
+                              "type": "string",
+                              "description": "Version of the messaging service"
+                            },
+                            "deploymentType": {
+                              "type": "string",
+                              "description": "Deployment type (e.g., on-premises, cloud, etc.)"
+                            },
+                            "messageVolume": {
+                              "type": "string",
+                              "description": "Approximate message volume"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "responses": {
+                    "200": {
+                      "description": "Analysis results",
+                      "content": {
+                        "application/json": {
+                          "schema": {
+                            "type": "object",
+                            "properties": {
+                              "compatibilityScore": {
+                                "type": "number",
+                                "description": "Compatibility score (0-100)"
+                              },
+                              "recommendations": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                },
+                                "description": "Migration recommendations"
+                              },
+                              "challenges": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string"
+                                },
+                                "description": "Potential migration challenges"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+      
+  # Action Group for Cost Estimation
+  CostEstimationActionGroup:
+    Type: AWS::Bedrock::AgentActionGroup
+    DependsOn: MQMigrationAgent
+    Properties:
+      AgentId: !Ref MQMigrationAgent
+      ActionGroupName: EstimateCosts
+      ActionGroupExecutor:
+        Lambda: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-estimate-costs
+      Description: Estimates costs for migrating to Amazon MQ
+      ParentActionGroupSignature: AMAZON.UserInput
+      ActionGroupState: ENABLED
+      ApiSchema:
+        Payload: |
+          {
+            "openapi": "3.0.0",
+            "info": {
+              "title": "Cost Estimation API",
+              "version": "1.0.0",
+              "description": "API for estimating migration costs"
+            },
+            "paths": {
+              "/estimate": {
+                "post": {
+                  "summary": "Estimate migration costs",
+                  "operationId": "estimateCosts",
+                  "requestBody": {
+                    "required": true,
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "type": "object",
+                          "required": ["brokerType", "instanceType", "deploymentMode"],
+                          "properties": {
+                            "brokerType": {
+                              "type": "string",
+                              "enum": ["ActiveMQ", "RabbitMQ"],
+                              "description": "Type of Amazon MQ broker"
+                            },
+                            "instanceType": {
+                              "type": "string",
+                              "description": "Instance type for the broker"
+                            },
+                            "deploymentMode": {
+                              "type": "string",
+                              "enum": ["SINGLE_INSTANCE", "ACTIVE_STANDBY_MULTI_AZ"],
+                              "description": "Deployment mode for the broker"
+                            },
+                            "storageType": {
+                              "type": "string",
+                              "description": "Storage type for the broker"
+                            },
+                            "storageSize": {
+                              "type": "integer",
+                              "description": "Storage size in GB"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "responses": {
+                    "200": {
+                      "description": "Cost estimation results",
+                      "content": {
+                        "application/json": {
+                          "schema": {
+                            "type": "object",
+                            "properties": {
+                              "monthlyCost": {
+                                "type": "number",
+                                "description": "Estimated monthly cost in USD"
+                              },
+                              "setupCost": {
+                                "type": "number",
+                                "description": "Estimated one-time setup cost in USD"
+                              },
+                              "migrationEffort": {
+                                "type": "string",
+                                "description": "Estimated migration effort (Low, Medium, High)"
+                              },
+                              "costBreakdown": {
+                                "type": "object",
+                                "description": "Detailed cost breakdown"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+  # Action Group for Migration Planning
+  MigrationPlanningActionGroup:
+    Type: AWS::Bedrock::AgentActionGroup
+    DependsOn: MQMigrationAgent
+    Properties:
+      AgentId: !Ref MQMigrationAgent
+      ActionGroupName: PlanMigration
+      ActionGroupExecutor:
+        Lambda: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-plan-migration
+      Description: Creates a migration plan for moving to Amazon MQ
+      ParentActionGroupSignature: AMAZON.UserInput
+      ActionGroupState: ENABLED
+      ApiSchema:
+        Payload: |
+          {
+            "openapi": "3.0.0",
+            "info": {
+              "title": "Migration Planning API",
+              "version": "1.0.0",
+              "description": "API for planning migration to Amazon MQ"
+            },
+            "paths": {
+              "/plan": {
+                "post": {
+                  "summary": "Create migration plan",
+                  "operationId": "createMigrationPlan",
+                  "requestBody": {
+                    "required": true,
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "type": "object",
+                          "required": ["currentService", "targetService"],
+                          "properties": {
+                            "currentService": {
+                              "type": "string",
+                              "description": "Current messaging service"
+                            },
+                            "targetService": {
+                              "type": "string",
+                              "enum": ["Amazon MQ for ActiveMQ", "Amazon MQ for RabbitMQ"],
+                              "description": "Target Amazon MQ service"
+                            },
+                            "timeframe": {
+                              "type": "string",
+                              "description": "Desired timeframe for migration"
+                            },
+                            "constraints": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              },
+                              "description": "Migration constraints or requirements"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "responses": {
+                    "200": {
+                      "description": "Migration plan",
+                      "content": {
+                        "application/json": {
+                          "schema": {
+                            "type": "object",
+                            "properties": {
+                              "phases": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "name": {
+                                      "type": "string",
+                                      "description": "Phase name"
+                                    },
+                                    "description": {
+                                      "type": "string",
+                                      "description": "Phase description"
+                                    },
+                                    "duration": {
+                                      "type": "string",
+                                      "description": "Estimated duration"
+                                    },
+                                    "tasks": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "description": "Tasks in this phase"
+                                    }
+                                  }
+                                },
+                                "description": "Migration phases"
+                              },
+                              "totalDuration": {
+                                "type": "string",
+                                "description": "Total estimated duration"
+                              },
+                              "risks": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "severity": {
+                                      "type": "string"
+                                    },
+                                    "mitigation": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "description": "Identified risks"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+Outputs:
+  AgentId:
+    Description: The ID of the Bedrock agent
+    Value: !Ref MQMigrationAgent
+    Export:
+      Name: !Sub ${AWS::StackName}-AgentId
+  
+  AgentAliasId:
+    Description: The ID of the Bedrock agent alias
+    Value: !GetAtt MQMigrationAgent.AgentId
+    Export:
+      Name: !Sub ${AWS::StackName}-AgentAliasId
+  
+  KnowledgeBaseId:
+    Description: The ID of the knowledge base
+    Value: !Ref MQMigrationKnowledgeBase
+    Export:
+      Name: !Sub ${AWS::StackName}-KnowledgeBaseId
+  
+  S3BucketName:
+    Description: The name of the S3 bucket for agent artifacts and knowledge base documents
+    Value: !Ref AgentS3Bucket
+    Export:
+      Name: !Sub ${AWS::StackName}-S3BucketName
